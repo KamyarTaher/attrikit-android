@@ -25,7 +25,7 @@ and in your app module:
 
 ```kotlin
 dependencies {
-    implementation("com.github.KamyarTaher:attrikit-android:1.3.0")
+    implementation("com.github.KamyarTaher:attrikit-android:1.3.1")
 }
 ```
 
@@ -115,9 +115,13 @@ consent and nothing else. A key that is not 16 to 512 bytes throws `IllegalArgum
 AttriKit.setConsent(ConsentState.TRACKING_GRANTED)
 ```
 
-The advertising id and App Set ID are read once, when the first open is built. If the user has
-already chosen, pass that choice to `start`: upgrading to `TRACKING_GRANTED` after the first open has
-been built does not send them.
+The advertising id and App Set ID are read only under `TRACKING_GRANTED`: when the first open is
+built, at every `start`, and when tracking is granted. Most apps ask for tracking after onboarding, so
+their first open goes out without the ids. When tracking is granted later, by `setConsent` or by the
+consent you pass to a later `start`, the SDK records the grant with AttriKit and then sends both ids,
+so Google receives the advertising id for those installs too. Each pair is sent once, and again if
+the user resets the advertising id. Lowering consent from `TRACKING_GRANTED` erases the ids from the
+device and records the change with AttriKit.
 
 ## Track events
 
@@ -239,7 +243,7 @@ one hour. All methods are safe to call from any thread.
 | App version | at start, on the SDK thread | `PackageManager` |
 | Country, languages, OS major, phone or tablet, device model, build id, timezone, screen size and density | at start | `Locale`, `Resources`, `Build` |
 | Google Play install referrer | once, at first open, bounded to 5 seconds | Play Install Referrer API |
-| Advertising id (GAID) and App Set ID | once, when the first open is built, and only if consent is `TRACKING_GRANTED` at that moment; never if the user turned off or deleted the advertising id. A later upgrade to `TRACKING_GRANTED` does not send them | Play services |
+| Advertising id (GAID) and App Set ID | only while consent is `TRACKING_GRANTED`: when the first open is built, at every start, and when tracking is granted after the first open; never if the user turned off or deleted the advertising id | Play services |
 | IAB TCF keys | whenever an event or first open is built, unless disabled | the app's default SharedPreferences |
 
 Everything the SDK itself persists is in the private preferences file `dev.attrkit.sdk`. No

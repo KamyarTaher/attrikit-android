@@ -1,5 +1,22 @@
 # AttriKit for Android: changes
 
+## 1.3.1
+
+- **The advertising id after a later tracking grant.** 1.3.0 sent the advertising id and App Set ID
+  only with the first open, and only if consent was `TRACKING_GRANTED` at that moment. An app that
+  asks for tracking after onboarding therefore never sent them, and Google never received the
+  advertising id for those installs. When tracking is granted after the first open, by `setConsent`
+  or by the consent passed to a later `start`, the SDK now records the grant with AttriKit (a consent
+  receipt with scope `tracking`) and then sends both ids in an identify request.
+- **Read at every start.** While consent is `TRACKING_GRANTED` the ids are read once per launch, so an
+  advertising id the user resets is sent. A pair already sent is not sent again, and an id the user
+  turns off is never sent.
+- **Taking tracking back.** Lowering consent from `TRACKING_GRANTED` erases the stored ids from the
+  device and sends a consent receipt with the new state. Nothing is read or sent without
+  `TRACKING_GRANTED`, as before.
+
+No API change. Upgrade by changing the dependency to `1.3.1`.
+
 ## 1.3.0 (first public release)
 
 AttriKit for Android measures installs and in-app events and matches them to the campaign that

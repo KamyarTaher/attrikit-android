@@ -88,6 +88,26 @@ internal object StorageKeys {
     const val IDENTIFY_REFUSED = "io.attrikit.identify.refused"
     const val IDENTIFY_RETRY = "io.attrikit.identify.retry"
 
+    /// The advertising id and App Set ID read under tracking consent, as a [DeviceIdentifiers]
+    /// record for the current epoch, until an identify delivers them. Delivered, refused and retry
+    /// follow the user id's keys above, keyed on the whole record. All four are erased the moment
+    /// tracking consent is lost: an identifier must not outlive the consent that allowed reading it.
+    const val DEVICE_IDS = "io.attrikit.device-ids"
+    const val DEVICE_IDS_DELIVERED = "io.attrikit.device-ids.delivered"
+    const val DEVICE_IDS_REFUSED = "io.attrikit.device-ids.refused"
+    const val DEVICE_IDS_RETRY = "io.attrikit.device-ids.retry"
+
+    /// `<install epoch>\t<state>`: the tracking state the server is known to hold for the epoch,
+    /// `tracking_granted` or `measurement_granted`, from a first-open it stored or a tracking receipt
+    /// it acknowledged. The server keeps an identify's advertising id only for an occurrence it holds
+    /// as tracking_granted, so the identify carrying one waits for this to say so.
+    const val TRACKING_STATE_ACKNOWLEDGED = "io.attrikit.tracking-state.acknowledged"
+
+    /// `<install epoch>\t<state>` of a tracking receipt the server refused outright. That receipt
+    /// is raised from state, not from a transition, so without this every work() would raise it
+    /// again. Dropped at every launch, as the other refused markers are.
+    const val TRACKING_RECEIPT_REFUSED = "io.attrikit.tracking-receipt.refused"
+
     /// `<installation id>|<install epoch>` of an erasure the user asked for and the server has not
     /// yet acknowledged. Persisted BEFORE the request, so a process that dies mid-flight, or a
     /// server that is down, leaves measurement halted rather than resumed over a deletion request.
@@ -102,8 +122,29 @@ internal object StorageKeys {
         FIRST_OPEN_REFUSED_EPOCH, FIRST_OPEN_RETRY, EVENT_QUEUE, EVENT_QUEUE_DISCARDED_AT, EVENT_RETRY,
         SESSION_INDEX, CONSENT_RECEIPT_PENDING, CONSENT_RECEIPT_RETRY, CONSENT_RECEIPT_IDEMPOTENCY,
         CONSENT_RECEIPT_EPOCH, CONSENT_RECEIPT_ARCHIVE, USER_ID, IDENTIFY_DELIVERED, IDENTIFY_REFUSED,
-        IDENTIFY_RETRY, DELETION_TOMBSTONE, DELETION_RETRY,
+        IDENTIFY_RETRY, DEVICE_IDS, DEVICE_IDS_DELIVERED, DEVICE_IDS_REFUSED, DEVICE_IDS_RETRY,
+        TRACKING_STATE_ACKNOWLEDGED, TRACKING_RECEIPT_REFUSED, DELETION_TOMBSTONE, DELETION_RETRY,
     )
+}
+
+/// The device's advertising id and App Set ID for one install epoch, at least one of them present.
+/// Stored as `<epoch>\t<gaid>\t<app set id>` with an empty field for an absent id, and that encoding
+/// is also the delivered and refused marker: a new epoch or a changed id is a new fact to deliver.
+internal data class DeviceIdentifiers(val epoch: String, val gaid: UUID?, val appSetId: UUID?) {
+    fun encode(): String =
+        "$epoch\t${gaid?.toString()?.lowercase().orEmpty()}\t${appSetId?.toString()?.lowercase().orEmpty()}"
+
+    companion object {
+        /// Null for an unreadable record, and for one with neither id: there is nothing to send.
+        fun decode(value: String): DeviceIdentifiers? {
+            val parts = value.split('\t')
+            if (parts.size != 3 || parts[0].isEmpty()) return null
+            val gaid = if (parts[1].isEmpty()) null else parts[1].toUuid() ?: return null
+            val appSetId = if (parts[2].isEmpty()) null else parts[2].toUuid() ?: return null
+            if (gaid == null && appSetId == null) return null
+            return DeviceIdentifiers(parts[0], gaid, appSetId)
+        }
+    }
 }
 
 internal data class DeletionTombstone(val installationId: UUID, val installEpochId: UUID) {

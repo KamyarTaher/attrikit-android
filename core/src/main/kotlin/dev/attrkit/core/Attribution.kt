@@ -120,20 +120,30 @@ sealed interface DeletionResult {
     data class Failed(val statusCode: Int?) : DeletionResult
 }
 
+/**
+ * `POST v1/ingest/identify`. The advertising id and App Set ID travel in the `idfa` and `idfv`
+ * slots, as they do in [FirstOpenEnvelope]: the server stores both slots for either platform, and
+ * hands the first to Google as the advertising id.
+ */
 internal data class IdentifyEnvelope(
     val installationId: UUID,
     val installEpochId: UUID,
     val occurredAt: Instant,
-    val customerUserID: String,
+    val customerUserID: String? = null,
+    val advertisingId: UUID? = null,
+    val appSetId: UUID? = null,
 ) {
     fun toJson(): String = Json.stringify(
-        linkedMapOf(
+        linkedMapOf<String, Any?>(
             "schema_version" to 1,
             "installation_id" to installationId.toString().lowercase(),
             "install_epoch_id" to installEpochId.toString().lowercase(),
             "occurred_at" to occurredAt.toWireTimestamp(),
-            "customer_user_id" to customerUserID,
-        ),
+        ).also { json ->
+            customerUserID?.let { json["customer_user_id"] = it }
+            advertisingId?.let { json["idfa"] = it.toString().lowercase() }
+            appSetId?.let { json["idfv"] = it.toString().lowercase() }
+        },
     )
 }
 

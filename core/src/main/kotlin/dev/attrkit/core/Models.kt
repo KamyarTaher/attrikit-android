@@ -3,7 +3,7 @@ package dev.attrkit.core
 import java.time.Instant
 import java.util.UUID
 
-const val ATTRIKIT_ANDROID_SDK_VERSION = "1.3.0"
+const val ATTRIKIT_ANDROID_SDK_VERSION = "1.3.1"
 
 /**
  * Consent state machine:

@@ -68,7 +68,9 @@ data class AdvertisingIdentifiers(
 )
 
 /**
- * The core calls this provider only while consent is TRACKING_GRANTED.
+ * The core calls this provider only while consent is TRACKING_GRANTED: for the first-open, once
+ * per launch, and when tracking is granted. It runs on the thread that called the core's start,
+ * setConsent or work, never the main thread in the Android library.
  * Platform implementations must also suppress a zero/LAT advertising ID.
  */
 fun interface AdvertisingIdProvider {

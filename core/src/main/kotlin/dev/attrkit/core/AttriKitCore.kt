@@ -78,6 +78,10 @@ class AttriKitCore(
     /// completed deletion.
     private var userId: String? = null
 
+    /// The epoch whose advertising ids this process has read, so a launch reads them once. Cleared
+    /// when tracking consent is lost, so the next grant reads them again.
+    private var deviceIdsReadEpoch: String? = null
+
     /// True from the moment an erasure is recorded until the server acknowledges it. Read from the
     /// tombstone at construction, so a relaunch in the middle of a deletion stays halted.
     private var deletionPending = store.get(StorageKeys.DELETION_TOMBSTONE) != null
@@ -150,12 +154,20 @@ class AttriKitCore(
         val now: Instant,
     )
 
+    private data class DeviceIdentifiersAttempt(
+        val request: HttpRequest,
+        val marker: String,
+        val retry: RetryState?,
+        val now: Instant,
+    )
+
     private data class DeletionAttempt(val request: HttpRequest, val retry: RetryState?, val now: Instant)
 
     private data class DeletionOutcome(val result: DeletionResult, val nextAttemptAt: Instant?)
 
     private data class ReceiptAttempt(
         val request: HttpRequest,
+        val body: String,
         val idempotencyKey: String,
         val retry: RetryState?,
         val now: Instant,
@@ -163,6 +175,7 @@ class AttriKitCore(
 
     private data class FirstOpenAttempt(
         val request: HttpRequest,
+        val body: String,
         val epoch: String,
         val retry: RetryState?,
         val now: Instant,
@@ -234,6 +247,7 @@ class AttriKitCore(
     fun start(apiKey: String, consent: ConsentState): WorkResult {
         require(apiKey.toByteArray().size in 16..512) { "apiKey must be 16..512 bytes" }
         if (applyStart(apiKey, consent)) ensureFirstOpenSnapshot()
+        refreshDeviceIdentifiers()
         return work()
     }
 
@@ -276,6 +290,9 @@ class AttriKitCore(
         val rewritten = rewrittenPendingFirstOpenForConsent(previous, consent)
         val writes = mutableMapOf<String, String?>(StorageKeys.CONSENT to consent.wireValue)
         if (rewritten != null) writes[StorageKeys.FIRST_OPEN_PENDING_BODY] = rewritten
+        // Identifiers a build without this erase left on disk: an app rolled back to 1.3.0 changes
+        // consent without knowing these keys.
+        if (!consent.allowsAdvertisingIdentifiers) writes.putAll(DEVICE_ID_KEYS.associateWith { null })
         store.write(writes)
         beginMeasurement()
         return true
@@ -283,6 +300,7 @@ class AttriKitCore(
 
     fun setConsent(newConsent: ConsentState): WorkResult {
         if (applyConsent(newConsent)) ensureFirstOpenSnapshot()
+        refreshDeviceIdentifiers()
         return work()
     }
 
@@ -324,6 +342,12 @@ class AttriKitCore(
         val rewritten = rewrittenPendingFirstOpenForConsent(previous, newConsent)
         val writes = mutableMapOf<String, String?>(StorageKeys.CONSENT to newConsent.wireValue)
         if (rewritten != null) writes[StorageKeys.FIRST_OPEN_PENDING_BODY] = rewritten
+        // In the consent's own write, so no crash can leave an advertising id on disk under a
+        // consent that no longer allows it.
+        if (!newConsent.allowsAdvertisingIdentifiers) {
+            writes.putAll(DEVICE_ID_KEYS.associateWith { null })
+            deviceIdsReadEpoch = null
+        }
         store.write(writes)
         if (!newConsent.allowsMeasurement || previous.allowsMeasurement || deletionPending) return false
         beginMeasurement()
@@ -379,10 +403,14 @@ class AttriKitCore(
     }
 
     private fun rearmRefusedFirstOpenForLaunch() {
-        // The same per-launch second chance for an identify the server refused outright.
-        if (store.get(StorageKeys.IDENTIFY_REFUSED) != null) {
-            store.write(mapOf(StorageKeys.IDENTIFY_REFUSED to null))
-        }
+        // The same per-launch second chance for an identify or a tracking receipt the server
+        // refused outright.
+        val refused = listOf(
+            StorageKeys.IDENTIFY_REFUSED,
+            StorageKeys.DEVICE_IDS_REFUSED,
+            StorageKeys.TRACKING_RECEIPT_REFUSED,
+        ).filter { store.get(it) != null }
+        if (refused.isNotEmpty()) store.write(refused.associateWith { null })
         val epoch = store.get(StorageKeys.INSTALL_EPOCH_ID)?.lowercase() ?: return
         if (store.get(StorageKeys.FIRST_OPEN_REFUSED_EPOCH) == epoch) {
             store.write(mapOf(StorageKeys.FIRST_OPEN_REFUSED_EPOCH to null))
@@ -393,7 +421,8 @@ class AttriKitCore(
      * A failed first-open remains crash-safe, but advertising identifiers must not outlive
      * the tracking consent that allowed their collection. Keep the original first-open and
      * referrer timestamps while rewriting the SDK-owned canonical JSON before any retry.
-     * Identifiers are removed on downgrade and are never added on a later upgrade.
+     * Identifiers are removed on downgrade and are never added on a later upgrade; a later grant
+     * sends them in an identify instead (submitDeviceIdentifiersIfDue).
      *
      * Returns the rewritten pending body if changed, or null if unchanged or not pending.
      * Written atomically with consent in a single KeyValueStore write to eliminate crash windows.
@@ -533,10 +562,15 @@ class AttriKitCore(
                 val deletionNext = drainDeletionIfDue()
                 return synchronized(this) { currentWorkResult(deletionNext) }
             }
+            // Raised before the drain below so it is sent in this pass.
+            synchronized(this) { reconcileTrackingReceipt() }
             // Ahead of the consent gate below, and deliberately so: a withdrawal receipt is only
             // ever raised by consent going away, so anything gated on allowsMeasurement can never
             // send it.
-            val receiptNext = drainConsentReceiptIfDue()
+            var receiptNext = drainConsentReceiptIfDue()
+            // Again once that drain has run: delivering this epoch's withdrawal frees the slot a
+            // tracking grant waits for. Raises at most one receipt, so this cannot loop.
+            if (synchronized(this) { reconcileTrackingReceipt() }) receiptNext = drainConsentReceiptIfDue()
             val measuring = synchronized(this) {
                 if (apiKey == null || !consent.allowsMeasurement) {
                     false
@@ -548,7 +582,7 @@ class AttriKitCore(
             if (!measuring) return synchronized(this) { currentWorkResult(receiptNext) }
             ensureFirstOpenSnapshot()
             val firstNext = submitFirstOpenIfDue()
-            val identifyNext = submitIdentifyIfDue()
+            val identifyNext = minInstant(submitIdentifyIfDue(), submitDeviceIdentifiersIfDue())
             val eventNext = flushEventsIfDue()
             val pollNext = pollAttributionIfDue()
             return synchronized(this) {
@@ -574,7 +608,10 @@ class AttriKitCore(
             minInstant(
                 queue.retryState()?.nextAttemptAt,
                 minInstant(
-                    RetryState.decode(store.get(StorageKeys.IDENTIFY_RETRY))?.nextAttemptAt,
+                    minInstant(
+                        RetryState.decode(store.get(StorageKeys.IDENTIFY_RETRY))?.nextAttemptAt,
+                        RetryState.decode(store.get(StorageKeys.DEVICE_IDS_RETRY))?.nextAttemptAt,
+                    ),
                     minInstant(
                         RetryState.decode(store.get(StorageKeys.DELETION_RETRY))?.nextAttemptAt,
                         attributionPoll?.nextAt,
@@ -701,11 +738,18 @@ class AttriKitCore(
                 localEpochPresent = current.localEpochPresent,
                 dma = dmaConsent(),
             )
+            // This launch's read of the identifiers as well, so refreshDeviceIdentifiers does not
+            // ask Play a second time.
+            val identifierWrites = if (includeIdentifiers) {
+                deviceIdentifierWrites(epoch, identifiers.gaid, identifiers.appSetId)
+            } else {
+                emptyMap()
+            }
             store.write(
                 mapOf(
                     StorageKeys.FIRST_OPEN_PENDING_EPOCH to epoch,
                     StorageKeys.FIRST_OPEN_PENDING_BODY to envelope.toJson(),
-                ),
+                ) + identifierWrites,
             )
         }
     }
@@ -725,6 +769,7 @@ class AttriKitCore(
             FirstOpenAttempt(
                 request = RequestFactory(configuration.endpoint, key, ids)
                     .post("v1/ingest/first-open", body, epoch),
+                body = body,
                 epoch = epoch,
                 retry = retry,
                 now = now,
@@ -737,7 +782,7 @@ class AttriKitCore(
             // delivery gate for an epoch the server has never seen.
             if (identity?.installEpochId?.toString()?.lowercase() != attempt.epoch) return null
             when {
-                status != null && status in 200..299 -> settleFirstOpen(attempt.epoch)
+                status != null && status in 200..299 -> settleFirstOpen(attempt.epoch, attempt.body)
                 // 409 `idempotency_conflict` is a REGISTRATION, not a refusal. The server answers it
                 // only after finding an occurrence already stored under this install_epoch_id whose
                 // payload hash differs from ours (apps/link/src/ingestion/routes.ts:381, and
@@ -754,7 +799,7 @@ class AttriKitCore(
                 //
                 // The shipped iOS SDK already does this (CoreRuntime.swift:950, `case 409:
                 // registerFirstOpen()`); Android was the outlier.
-                status == 409 -> settleFirstOpen(attempt.epoch)
+                status == 409 -> settleFirstOpen(attempt.epoch, storedBody = null)
                 // A refusal is NOT a registration. This used to mark the epoch settled, which let
                 // the event flush proceed against an epoch the server had never accepted: every
                 // batch then came back unknown_install_epoch and was destroyed as a permanent
@@ -787,15 +832,44 @@ class AttriKitCore(
         )
     }
 
-    private fun settleFirstOpen(epoch: String) {
+    /// [storedBody] is the body a 2xx stored. A 409 passes null: the server holds a different body,
+    /// so the consent and identifiers this one carried prove nothing about the occurrence, and the
+    /// tracking state it holds is recorded as unknown (see reconcileTrackingReceipt).
+    private fun settleFirstOpen(epoch: String, storedBody: String?) {
         store.write(
             mapOf(
                 StorageKeys.FIRST_OPEN_SETTLED_EPOCH to epoch,
                 StorageKeys.FIRST_OPEN_PENDING_EPOCH to null,
                 StorageKeys.FIRST_OPEN_PENDING_BODY to null,
                 StorageKeys.FIRST_OPEN_RETRY to null,
-            ),
+            ) + (
+                storedBody?.let { firstOpenAcknowledgement(epoch, it) }
+                    ?: mapOf(StorageKeys.TRACKING_STATE_ACKNOWLEDGED to "$epoch\t$TRACKING_STATE_UNKNOWN")
+                ),
         )
+    }
+
+    /// What a stored first-open tells the SDK: the occurrence's consent is the body's, and the
+    /// advertising id and App Set ID it carried are delivered. The delivered record is not written
+    /// once tracking consent is gone, since it quotes the advertising id.
+    private fun firstOpenAcknowledgement(epoch: String, body: String): Map<String, String?> {
+        val json = jsonObject(body) ?: return emptyMap()
+        val state = (json["consent"] as? Map<*, *>)?.get("state") as? String ?: return emptyMap()
+        if (state != ConsentState.MEASUREMENT_GRANTED.wireValue && state != ConsentState.TRACKING_GRANTED.wireValue) {
+            return emptyMap()
+        }
+        val writes = mutableMapOf<String, String?>(StorageKeys.TRACKING_STATE_ACKNOWLEDGED to "$epoch\t$state")
+        if (state == ConsentState.TRACKING_GRANTED.wireValue && consent.allowsAdvertisingIdentifiers) {
+            val carried = DeviceIdentifiers(
+                epoch,
+                PlayInstallReferrerParser.uuidOrNull(json["idfa"] as? String),
+                PlayInstallReferrerParser.uuidOrNull(json["idfv"] as? String),
+            )
+            if (carried.gaid != null || carried.appSetId != null) {
+                writes[StorageKeys.DEVICE_IDS_DELIVERED] = carried.encode()
+            }
+        }
+        return writes
     }
 
     private fun scheduleFirstOpenRetry(current: RetryState?, now: Instant): Instant? {
@@ -879,7 +953,14 @@ class AttriKitCore(
                         // re-registers; Android persists it, so without this the gate would stay
                         // open across every relaunch, first-open would never be re-sent, and the
                         // head batch would block the queue permanently. Re-arm registration instead.
-                        store.write(mapOf(StorageKeys.FIRST_OPEN_SETTLED_EPOCH to null))
+                        // The ids that server had are gone with it: if the re-registration cannot
+                        // carry them (Play failing at that moment), the next read must send them.
+                        store.write(
+                            mapOf(
+                                StorageKeys.FIRST_OPEN_SETTLED_EPOCH to null,
+                                StorageKeys.DEVICE_IDS_DELIVERED to null,
+                            ),
+                        )
                         return scheduleEventRetry(window.retry, window.now, longBackoff = false).nextAttemptAt
                     }
                     status != null && isPermanentClientFailure(status) -> {
@@ -971,14 +1052,16 @@ class AttriKitCore(
      * Silent when there is no identity yet, which is a first-run denial before anything was ever
      * collected: the schema is keyed on installation_id and install_epoch_id, and there is no
      * install to attribute a receipt to.
+     *
+     * [scope] is `tracking` for the receipt reconcileTrackingReceipt raises for a tracking change.
      */
-    private fun enqueueConsentReceipt(state: ConsentState) {
+    private fun enqueueConsentReceipt(state: ConsentState, scope: String = "measurement") {
         val current = identity ?: return
         val body = Json.stringify(
             mapOf(
                 "installation_id" to current.installationId.toString().lowercase(),
                 "install_epoch_id" to current.installEpochId.toString().lowercase(),
-                "scope" to "measurement",
+                "scope" to scope,
                 "consent" to mapOf("state" to state.wireValue, "policy_version" to 1),
                 "occurred_at" to clock.now().toWireTimestamp(),
                 "source" to "android_sdk",
@@ -1086,6 +1169,7 @@ class AttriKitCore(
             ReceiptAttempt(
                 request = RequestFactory(configuration.endpoint, key, ids)
                     .post("v1/ingest/consent", body, idempotencyKey),
+                body = body,
                 idempotencyKey = idempotencyKey,
                 retry = retry,
                 now = now,
@@ -1100,13 +1184,13 @@ class AttriKitCore(
             }
             when {
                 status != null && status in 200..299 -> {
-                    clearConsentReceipt()
+                    clearConsentReceipt(trackingReceiptOutcome(attempt.body, StorageKeys.TRACKING_STATE_ACKNOWLEDGED))
                     nextArchivedConsentReceiptAt(attempt.now)
                 }
                 // A permanent refusal is terminal: retrying it forever would send one request per
                 // work() tick for the life of the install.
                 status != null && isPermanentClientFailure(status) -> {
-                    clearConsentReceipt()
+                    clearConsentReceipt(trackingReceiptOutcome(attempt.body, StorageKeys.TRACKING_RECEIPT_REFUSED))
                     nextArchivedConsentReceiptAt(attempt.now)
                 }
                 else -> scheduleConsentReceiptRetry(attempt.retry, attempt.now)
@@ -1145,15 +1229,73 @@ class AttriKitCore(
         return next.nextAttemptAt
     }
 
-    private fun clearConsentReceipt() {
+    private fun clearConsentReceipt(outcome: Map<String, String?> = emptyMap()) {
         store.write(
             mapOf(
                 StorageKeys.CONSENT_RECEIPT_PENDING to null,
                 StorageKeys.CONSENT_RECEIPT_RETRY to null,
                 StorageKeys.CONSENT_RECEIPT_IDEMPOTENCY to null,
                 StorageKeys.CONSENT_RECEIPT_EPOCH to null,
-            ),
+            ) + outcome,
         )
+    }
+
+    /// For a tracking receipt about the current epoch, `key` set to `<epoch>\t<state>`: the state
+    /// the server now holds (TRACKING_STATE_ACKNOWLEDGED) or refused (TRACKING_RECEIPT_REFUSED).
+    /// Nothing for any other receipt.
+    private fun trackingReceiptOutcome(body: String, key: String): Map<String, String?> {
+        val json = jsonObject(body) ?: return emptyMap()
+        val epoch = identity?.installEpochId?.toString()?.lowercase() ?: return emptyMap()
+        if (json["scope"] != "tracking" || json["install_epoch_id"] != epoch) return emptyMap()
+        val state = (json["consent"] as? Map<*, *>)?.get("state") as? String ?: return emptyMap()
+        return mapOf(key to "$epoch\t$state")
+    }
+
+    /**
+     * Raises a `tracking` consent receipt when the tracking consent the server holds for this epoch
+     * differs from the SDK's, as the iOS SDK does when tracking is granted or taken back. The server
+     * keeps an identify's advertising id only for an occurrence it holds as tracking_granted, and an
+     * occurrence holds its first-open's consent until a receipt changes it. An app that asks for
+     * tracking after onboarding registered its first-open under measurement consent, so without
+     * this receipt the server would drop every advertising id the app sent afterwards.
+     *
+     * Decided from state rather than on the transition, so a grant made while this epoch's
+     * withdrawal is still undelivered, a launch started with a different consent than the stored
+     * one, and a first-open settled by a 409 all converge on the next work(). A downgrade is sent
+     * only to take back a tracking_granted the server holds, or may hold after a 409 left its state
+     * unknown. Under the monitor.
+     */
+    private fun reconcileTrackingReceipt(): Boolean {
+        if (apiKey == null || deletionPending || !consent.allowsMeasurement) return false
+        val epoch = identity?.installEpochId?.toString()?.lowercase() ?: return false
+        // Before registration the server has no occurrence to apply it to, and the pending first-open
+        // is rewritten to the current consent on every change, so it registers under the right one.
+        if (store.get(StorageKeys.FIRST_OPEN_SETTLED_EPOCH) != epoch) return false
+        val desired = consent.wireValue
+        if (store.get(StorageKeys.TRACKING_RECEIPT_REFUSED) == "$epoch\t$desired") return false
+        val pending = if (store.get(StorageKeys.CONSENT_RECEIPT_EPOCH) == epoch) {
+            store.get(StorageKeys.CONSENT_RECEIPT_PENDING)?.let(::jsonObject)
+                ?.let { (it["consent"] as? Map<*, *>)?.get("state") as? String }
+        } else {
+            null
+        }
+        val expected = pending ?: acknowledgedTrackingState(epoch)
+        if (expected == desired) return false
+        if (consent.allowsAdvertisingIdentifiers) {
+            // The pending slot holds one receipt per epoch. An undelivered withdrawal is sent
+            // first, not overwritten, and the grant follows once it is delivered.
+            if (pending == ConsentState.DENIED.wireValue || pending == ConsentState.REVOKED.wireValue) return false
+        } else if (expected != ConsentState.TRACKING_GRANTED.wireValue && expected != TRACKING_STATE_UNKNOWN) {
+            // A downgrade takes back only a tracking_granted the server holds or may hold.
+            return false
+        }
+        enqueueConsentReceipt(consent, scope = "tracking")
+        return true
+    }
+
+    private fun acknowledgedTrackingState(epoch: String): String? {
+        val parts = store.get(StorageKeys.TRACKING_STATE_ACKNOWLEDGED)?.split('\t') ?: return null
+        return if (parts.size == 2 && parts[0] == epoch) parts[1] else null
     }
 
     /**
@@ -1170,8 +1312,9 @@ class AttriKitCore(
      * - The send waits for first-open to be registered, as every other request about an install
      *   does, and is retried by [work] on the first-open ladder.
      *
-     * The device evidence (advertising ids, funnel hashes, an exact link token) the iOS SDK adds to
-     * the same request has no Android source in this core and is not sent.
+     * The advertising id and App Set ID go in an identify of their own (see
+     * [submitDeviceIdentifiersIfDue]). The funnel hashes and the exact link token the iOS SDK adds
+     * to the same request have no Android source in this core and are not sent.
      */
     fun setUserID(userId: String?): WorkResult {
         applySetUserID(userId)
@@ -1201,13 +1344,17 @@ class AttriKitCore(
     /// marker left behind would keep the id on disk after the user said no.
     private fun eraseUserStateOnWithdrawal() {
         userId = null
+        deviceIdsReadEpoch = null
         store.write(
             mapOf(
                 StorageKeys.USER_ID to null,
                 StorageKeys.IDENTIFY_DELIVERED to null,
                 StorageKeys.IDENTIFY_REFUSED to null,
                 StorageKeys.IDENTIFY_RETRY to null,
-            ),
+                // A withdrawal receipt replaces whatever tracking state the server held.
+                StorageKeys.TRACKING_STATE_ACKNOWLEDGED to null,
+                StorageKeys.TRACKING_RECEIPT_REFUSED to null,
+            ) + DEVICE_ID_KEYS.associateWith { null },
         )
         resetAttributionState()
     }
@@ -1273,6 +1420,123 @@ class AttriKitCore(
                 else -> scheduleLadderRetry(StorageKeys.IDENTIFY_RETRY, attempt.retry, attempt.now)
             }
         }
+    }
+
+    /**
+     * Sends the advertising id and App Set ID read under tracking consent in an identify of their
+     * own, in its `idfa` and `idfv` slots, once per epoch and pair. This is how they reach the server
+     * when tracking is granted after first-open, the usual order for an app that asks after
+     * onboarding: first-open never adds them later, so without it Google never received the
+     * advertising id of those installs.
+     *
+     * Never without TRACKING_GRANTED, and not before the server is known to hold the occurrence as
+     * tracking_granted (see reconcileTrackingReceipt): it would answer 200 and drop the advertising
+     * id. Retried on the first-open ladder like the user id's identify; a pair the first-open
+     * already carried counts as delivered.
+     */
+    private fun submitDeviceIdentifiersIfDue(): Instant? {
+        val attempt = synchronized(this) {
+            val key = apiKey ?: return null
+            if (!consent.allowsAdvertisingIdentifiers || deletionPending) return null
+            val current = identity ?: return null
+            val epoch = current.installEpochId.toString().lowercase()
+            if (store.get(StorageKeys.FIRST_OPEN_SETTLED_EPOCH) != epoch) return null
+            if (acknowledgedTrackingState(epoch) != ConsentState.TRACKING_GRANTED.wireValue) return null
+            val marker = store.get(StorageKeys.DEVICE_IDS) ?: return null
+            val identifiers = DeviceIdentifiers.decode(marker)?.takeIf { it.epoch == epoch } ?: return null
+            if (store.get(StorageKeys.DEVICE_IDS_DELIVERED) == marker) return null
+            if (store.get(StorageKeys.DEVICE_IDS_REFUSED) == marker) return null
+            val retry = RetryState.decode(store.get(StorageKeys.DEVICE_IDS_RETRY))
+            val now = clock.now()
+            if (retry != null && retry.nextAttemptAt > now) return retry.nextAttemptAt
+            DeviceIdentifiersAttempt(
+                request = RequestFactory(configuration.endpoint, key, ids).post(
+                    "v1/ingest/identify",
+                    IdentifyEnvelope(
+                        current.installationId,
+                        current.installEpochId,
+                        now,
+                        advertisingId = identifiers.gaid,
+                        appSetId = identifiers.appSetId,
+                    ).toJson(),
+                    ids.next().toString().lowercase(),
+                ),
+                marker = marker,
+                retry = retry,
+                now = now,
+            )
+        }
+        val response = runCatching { transport.execute(attempt.request) }.getOrNull()
+        val status = response?.statusCode
+        return synchronized(this) {
+            // The pair sent is no longer the one to deliver. Either tracking consent was lost in
+            // flight, which erased it, and a marker quoting it must not be written back; or a new
+            // read replaced it, which the next pass sends.
+            if (store.get(StorageKeys.DEVICE_IDS) != attempt.marker) return clock.now()
+            when {
+                status != null && status in 200..299 -> {
+                    store.write(
+                        mapOf(
+                            StorageKeys.DEVICE_IDS_DELIVERED to attempt.marker,
+                            StorageKeys.DEVICE_IDS_RETRY to null,
+                        ),
+                    )
+                    null
+                }
+                response != null && isUnknownInstallEpoch(response) ->
+                    scheduleLadderRetry(StorageKeys.DEVICE_IDS_RETRY, attempt.retry, attempt.now)
+                status != null && isPermanentClientFailure(status) -> {
+                    store.write(
+                        mapOf(
+                            StorageKeys.DEVICE_IDS_REFUSED to attempt.marker,
+                            StorageKeys.DEVICE_IDS_RETRY to null,
+                        ),
+                    )
+                    null
+                }
+                else -> scheduleLadderRetry(StorageKeys.DEVICE_IDS_RETRY, attempt.retry, attempt.now)
+            }
+        }
+    }
+
+    /**
+     * Reads the advertising id and App Set ID once per launch while consent is TRACKING_GRANTED, and
+     * again on a grant, for [submitDeviceIdentifiersIfDue]. Reading at every launch is what picks up
+     * an id the user reset; a pair already delivered is not sent again. Play IPC, so it runs off the
+     * monitor and only from callers that hold nothing ([start], [setConsent]), for the reason
+     * ensureFirstOpenSnapshot gives. A provider that throws leaves what is stored.
+     */
+    private fun refreshDeviceIdentifiers() {
+        val epoch = synchronized(this) {
+            if (apiKey == null || deletionPending || !consent.allowsAdvertisingIdentifiers) return
+            val epoch = identity?.installEpochId?.toString()?.lowercase() ?: return
+            if (deviceIdsReadEpoch == epoch) return
+            epoch
+        }
+        val read = runCatching { advertisingIdProvider.identifiers() }.getOrNull() ?: return
+        synchronized(this) {
+            // Consent can be withdrawn and the epoch rotated while Play answers.
+            if (deletionPending || !consent.allowsAdvertisingIdentifiers) return
+            if (identity?.installEpochId?.toString()?.lowercase() != epoch) return
+            val writes = deviceIdentifierWrites(epoch, read.gaid, read.appSetId)
+            if (writes.isNotEmpty()) store.write(writes)
+        }
+    }
+
+    /// The writes that make a pair read just now, under tracking consent, the epoch's identifiers.
+    /// A read with neither id removes the stored pair: the user switched the advertising id off, and
+    /// an id read before must not be sent after. Under the monitor.
+    private fun deviceIdentifierWrites(epoch: String, gaid: String?, appSetId: String?): Map<String, String?> {
+        deviceIdsReadEpoch = epoch
+        val read = DeviceIdentifiers(
+            epoch,
+            PlayInstallReferrerParser.uuidOrNull(gaid),
+            PlayInstallReferrerParser.uuidOrNull(appSetId),
+        )
+        val next = if (read.gaid == null && read.appSetId == null) null else read.encode()
+        if (store.get(StorageKeys.DEVICE_IDS) == next) return emptyMap()
+        // A new pair starts the ladder from its first rung, as a new user id does.
+        return mapOf(StorageKeys.DEVICE_IDS to next, StorageKeys.DEVICE_IDS_RETRY to null)
     }
 
     /// The first-open ladder (5s, 30s, 5m, 1h, 3h, 6h), parking for 24h on exhaustion or after a
@@ -1388,6 +1652,7 @@ class AttriKitCore(
         buffered.clear()
         identity = null
         userId = null
+        deviceIdsReadEpoch = null
         activeSession = null
         lastSessionEndedAt = null
         lastSessionIndex = null
@@ -1756,6 +2021,21 @@ class AttriKitCore(
 
         /// Every key the core stores, for a deletion. StorageKeys.ALL plus the one that lives here.
         private val ERASED_ON_DELETION = StorageKeys.ALL + CONSENT_CLEANUP_PENDING
+
+        /// TRACKING_STATE_ACKNOWLEDGED's state after a 409: the server holds an earlier body whose
+        /// consent this SDK cannot know. Never a consent this SDK sends, which is what keeps it apart.
+        private const val TRACKING_STATE_UNKNOWN = "unknown"
+
+        /// What was read under tracking consent, erased when it is lost. See StorageKeys.DEVICE_IDS.
+        private val DEVICE_ID_KEYS = listOf(
+            StorageKeys.DEVICE_IDS,
+            StorageKeys.DEVICE_IDS_DELIVERED,
+            StorageKeys.DEVICE_IDS_REFUSED,
+            StorageKeys.DEVICE_IDS_RETRY,
+        )
+
+        /// A body this SDK wrote, read back as a JSON object, or null.
+        private fun jsonObject(body: String): Map<*, *>? = runCatching { Json.parse(body) as? Map<*, *> }.getOrNull()
 
         /// Parses the delta-seconds form of `Retry-After`, the only form the AttriKit API emits, and
         /// clamps it to the ladder's ceiling. An HTTP-date, a non-numeric or a non-positive value
