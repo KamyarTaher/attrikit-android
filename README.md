@@ -25,7 +25,7 @@ and in your app module:
 
 ```kotlin
 dependencies {
-    implementation("com.github.KamyarTaher:attrikit-android:1.3.1")
+    implementation("com.github.KamyarTaher:attrikit-android:1.4.0")
 }
 ```
 

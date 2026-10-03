@@ -1,5 +1,16 @@
 # AttriKit for Android: changes
 
+## 1.4.0
+
+- **The screen size and scale now describe the whole display.** The SDK used to send the size of the
+  app's window, which on most phones leaves out the navigation bar, and a scale rounded through a
+  float (a 411 dpi screen went out as 2.568749904632568). AttriKit compares them with what the
+  browser reports for the full screen at the click, so an Android install almost never agreed with
+  its click on screen. The SDK now sends the full display size and the exact scale, so the
+  comparison can match and add its evidence.
+
+No API change. Upgrade by changing the dependency to `1.4.0`.
+
 ## 1.3.1
 
 - **The advertising id after a later tracking grant.** 1.3.0 sent the advertising id and App Set ID

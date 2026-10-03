@@ -3,6 +3,9 @@ package dev.attrkit.android
 import android.content.Context
 import android.content.res.Configuration
 import android.os.Build
+import android.hardware.display.DisplayManager
+import android.util.DisplayMetrics
+import android.view.Display
 import dev.attrkit.core.CoarseContext
 import dev.attrkit.core.CoreConfiguration
 import dev.attrkit.core.DeviceSignals
@@ -25,7 +28,7 @@ internal data class DeviceFacts(
     val timezone: String?,
     val screenWidthPx: Int,
     val screenHeightPx: Int,
-    val density: Float,
+    val density: Double,
 ) {
     fun coarseContext(): CoarseContext =
         CoarseContext(
@@ -37,14 +40,14 @@ internal data class DeviceFacts(
 
     fun deviceSignals(): DeviceSignals {
         val hasScreen = screenWidthPx in 1..MAX_SCREEN_PX && screenHeightPx in 1..MAX_SCREEN_PX &&
-            density.isFinite() && density > 0f && density <= MAX_SCALE
+            density.isFinite() && density > 0.0 && density <= MAX_SCALE
         return DeviceSignals(
             deviceModel = model.bounded(),
             osBuild = osBuild.bounded(),
             timezone = timezone.bounded(),
             screenWidth = screenWidthPx.takeIf { hasScreen },
             screenHeight = screenHeightPx.takeIf { hasScreen },
-            screenScale = density.toDouble().takeIf { hasScreen },
+            screenScale = density.takeIf { hasScreen },
             languages = languageTags.distinct().take(MAX_LANGUAGES),
         )
     }
@@ -63,7 +66,7 @@ internal data class DeviceFacts(
         private val COUNTRY = Regex("^[A-Z]{2}$")
         private const val TABLET_MIN_WIDTH_DP = 600
         private const val MAX_SCREEN_PX = 16_384
-        private const val MAX_SCALE = 8f
+        private const val MAX_SCALE = 8.0
         private const val MAX_LANGUAGES = 16
         private const val MAX_TAG_LENGTH = 35
 
@@ -81,6 +84,7 @@ internal data class DeviceFacts(
         fun read(context: Context): DeviceFacts {
             val resources = context.resources
             val metrics = resources.displayMetrics
+            val (widthPx, heightPx) = fullDisplayPixels(context, metrics)
             val locales = deviceLocales(resources.configuration)
             val tags = locales.mapNotNull(::languageTag)
             val primary = locales.firstOrNull()
@@ -93,11 +97,46 @@ internal data class DeviceFacts(
                 model = Build.MODEL,
                 osBuild = Build.ID,
                 timezone = TimeZone.getDefault().id,
-                screenWidthPx = metrics.widthPixels,
-                screenHeightPx = metrics.heightPixels,
-                density = metrics.density,
+                screenWidthPx = widthPx,
+                screenHeightPx = heightPx,
+                density = scaleFromDpi(metrics.densityDpi),
             )
         }
+
+        /**
+         * The browser reports `screen.width`/`screen.height` and `devicePixelRatio`, which describe the
+         * whole panel. `resources.displayMetrics` describes the app's usable area (no navigation bar,
+         * different again in multi-window), so the full display comes from the display itself.
+         * DisplayManager rather than WindowManager: the SDK holds the application context, and
+         * WindowManager on a non-visual context is an incorrect-context-use violation from API 30.
+         * `getRealMetrics` is deprecated from API 31 and still returns the whole display's logical
+         * size, which is what Chrome's `screen` is. Falls back to the resources metrics if the display
+         * cannot be read.
+         */
+        @Suppress("DEPRECATION")
+        private fun fullDisplayPixels(context: Context, fallback: DisplayMetrics): Pair<Int, Int> =
+            try {
+                // getSystemService(String), not getSystemService(Class): the Class overload arrived
+                // in API 23 and minSdk is 21, where it throws NoSuchMethodError, which no
+                // `catch (Exception)` sees.
+                val display = (context.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager)
+                    ?.getDisplay(Display.DEFAULT_DISPLAY)
+                if (display == null) {
+                    fallback.widthPixels to fallback.heightPixels
+                } else {
+                    val real = DisplayMetrics()
+                    display.getRealMetrics(real)
+                    real.widthPixels to real.heightPixels
+                }
+            } catch (_: Exception) {
+                fallback.widthPixels to fallback.heightPixels
+            }
+
+        /**
+         * The same quantity as `DisplayMetrics.density`, computed in Double. The Float widens with
+         * noise (a 411 dpi panel gives 2.568749904632568), which never equals the browser's 2.56875.
+         */
+        fun scaleFromDpi(densityDpi: Int): Double = densityDpi / 160.0
 
         // LocaleList arrived in API 24; below it the configuration holds the one locale.
         @Suppress("DEPRECATION")

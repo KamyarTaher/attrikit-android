@@ -14,7 +14,7 @@ class DeviceFactsTest {
         model: String? = "Pixel 9",
         width: Int = 1080,
         height: Int = 2424,
-        density: Float = 2.75f,
+        density: Double = 2.75,
     ) = DeviceFacts(country, tags, osRelease, widthDp, model, "AP4A.250205.002", "Europe/Zurich", width, height, density)
 
     @Test
@@ -28,6 +28,23 @@ class DeviceFactsTest {
         assertEquals(1080, signals.screenWidth)
         assertEquals(2.75, signals.screenScale!!, 0.0)
         assertEquals(listOf("de-CH", "en-US"), signals.languages)
+    }
+
+    @Test
+    fun aFourHundredElevenDpiScaleIsExactlyTheBrowsersRatio() {
+        assertEquals(2.56875, DeviceFacts.scaleFromDpi(411), 0.0)
+        assertEquals(2.625, DeviceFacts.scaleFromDpi(420), 0.0)
+        // The float a DisplayMetrics holds widens with noise; the Double path must not.
+        assertEquals(false, 2.56875f.toDouble() == 2.56875)
+        val signals = facts(density = DeviceFacts.scaleFromDpi(411)).deviceSignals()
+        assertEquals(2.56875, signals.screenScale!!, 0.0)
+    }
+
+    @Test
+    fun theFullPanelSizePassesThroughUnchanged() {
+        val signals = facts(width = 1080, height = 2400).deviceSignals()
+        assertEquals(1080, signals.screenWidth)
+        assertEquals(2400, signals.screenHeight)
     }
 
     @Test
@@ -48,7 +65,7 @@ class DeviceFactsTest {
 
     @Test
     fun oversizedOrInvalidSignalsBecomeAbsenceRatherThanA422() {
-        val signals = facts(model = "x".repeat(129), width = 0, density = 9f).deviceSignals()
+        val signals = facts(model = "x".repeat(129), width = 0, density = 9.0).deviceSignals()
         assertNull(signals.deviceModel)
         assertNull(signals.screenWidth)
         assertNull(signals.screenHeight)
